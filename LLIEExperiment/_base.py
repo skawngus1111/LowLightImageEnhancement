@@ -13,14 +13,22 @@ class BaseExperiment(object):
 
         self.args = args
         self.args.device = get_device()
-        self.scaler = torch.amp.GradScaler()
+        self.scaler = torch.cuda.amp.GradScaler()
+        self.final_epoch = 200
+        self.lr = 1e-3
 
         self.train_loader, self.test_loader = dataloader_generator(args)
 
         self.model = low_light_image_enhancement_model(self.args)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-4)
-        scheduler_step = CosineAnnealingRestartCyclicLR(optimizer=self.optimizer, periods=[(1000 // 4) - 3, (1000 * 3) // 4], restart_weights=[1, 1], eta_mins=[0.0002, 0.0000001])
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        scheduler_step = CosineAnnealingRestartCyclicLR(optimizer=self.optimizer, periods=[(self.final_epoch // 4) - 3, (self.final_epoch * 3) // 4], restart_weights=[1, 1], eta_mins=[0.0002, 0.0000001])
         self.scheduler = GradualWarmupScheduler(self.optimizer, multiplier=1, total_epoch=3, after_scheduler=scheduler_step)
+        # self.scheduler = self.args.adjust_learning_rate(
+        #     self.optimizer,
+        #     self.final_epoch,
+        #     len(self.train_loader),
+        #     self.lr
+        # )
 
     def forward(self, data_batch):
         data_batch = self.cpu_to_gpu(data_batch)
@@ -44,3 +52,24 @@ class BaseExperiment(object):
             if isinstance(v, torch.Tensor):
                 data[k] = v.to(dev, non_blocking=True)
         return data
+
+def get_lr(step: int, total_steps: int, lr_max: float, lr_min: float) -> float:
+    """Compute learning rate according to cosine annealing schedule."""
+    return lr_min + (lr_max - lr_min) * 0.5 * (1 + np.cos(step / total_steps * np.pi))
+
+def adjust_learning_rate(optimizer, epochs: int, train_loader_len: int, learning_rate: float):
+    """
+    Cosine annealing 스케줄러 래퍼.
+    - optimizer: torch.optim.Optimizer
+    - epochs: 총 epoch 수
+    - train_loader_len: len(train_loader)
+    - learning_rate: initial lr
+    """
+    total_steps = epochs * train_loader_len
+
+    def lr_lambda(step: int) -> float:
+        # lr_lambda는 lr multiplicative factor를 반환해야 함.
+        return get_lr(step, total_steps, lr_max=1.0, lr_min=1e-6 / learning_rate)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    return scheduler

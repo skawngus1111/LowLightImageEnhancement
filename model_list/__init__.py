@@ -3,10 +3,12 @@ import torch.nn as nn
 
 from model_list.uformer import UFormer
 from model_list.restormer import Restormer
+from model_list.nano_llienet import NanoLLE
 
 MODEL_ZOO = {
     "UFormer": UFormer,
     "Restormer": Restormer,
+    "NanoLLIE": NanoLLE
 }
 
 def low_light_image_enhancement_model(args):

@@ -260,8 +260,8 @@ class Restormer(nn.Module):
 
         loss = self._calculate_loss(out_dec_level1, gt_img)
 
-        if self.training: return {'loss': loss}
-        else: return {'prediction': out_dec_level1,
+        # if self.training: return {'loss': loss}
+        return {'prediction': out_dec_level1,
                     'loss': loss}
 
     def _calculate_loss(self, prediction, ground_truth):
