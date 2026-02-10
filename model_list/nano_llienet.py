@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+def rgb_to_luma(x):
+    return 0.299*x[:,0:1] + 0.587*x[:,1:2] + 0.114*x[:,2:3]
 
 # ============= Ghost Module (효율적인 feature 생성) =============
 class GhostModule(nn.Module):
@@ -282,8 +284,24 @@ class NanoLLE(nn.Module):
 
         # ===== Multi-branch Prediction =====
         # Branch 1: Illumination adjustment
+        # illum_map = self.illum_head(f)
+        # enhanced_illum = x * illum_map + x  # Adaptive brightening
+
         illum_map = self.illum_head(f)
-        enhanced_illum = x * illum_map + x  # Adaptive brightening
+        L = rgb_to_luma(x).clamp(1e-4, 1.0)
+        R = x / (L + 1e-4)
+        R = R.clamp(0.0, 3.0)  # clamp(0,1) 제거!
+
+        # Headroom 기반
+        alpha = 2.0
+        gamma = 2.0
+        dark = (1.0 - L).pow(gamma)
+        highlight = torch.sigmoid((L - 0.75) / 0.06)
+        protect = 1.0 - 0.7 * highlight
+        delta = (alpha * illum_map * dark * protect).clamp(0.0, 1.0)
+        L_target = L + (1.0 - L) * delta
+
+        enhanced_illum = (R * L_target).clamp(0.0, 1.0)
 
         # Branch 2: Color restoration
         color_correction = self.color_restore(x, f)
@@ -296,12 +314,16 @@ class NanoLLE(nn.Module):
         pred = enhanced_illum + residual * color_correction
         pred = pred.clamp(0.0, 1.0)
 
-
-        loss = self._calculate_loss(pred, gt, illum_map) if gt is not None else None
+        # loss = self._calculate_loss(pred, gt, illum_map) if gt is not None else None
+        if gt is not None:
+            loss, loss_dict = self._calculate_loss(pred, gt, illum_map)
+        else:
+            loss, loss_dict = None, {}
 
         return {
             'prediction': pred,
             'loss': loss,
+            'loss_dict': loss_dict,  # 🔥 추가!
             'illum_map': illum_map,
             'color_correction': color_correction
         }
@@ -350,17 +372,24 @@ class NanoLLE(nn.Module):
 
         # Total loss
         total_loss = (
-                1.0 * recon_loss +  # Main reconstruction
-                0.1 * freq_loss +  # Frequency domain
-                0.2 * color_loss +  # Color consistency
-                # 0.01 * edge_loss +  # Edge preservation
-                0.05 * smooth_loss  # Illumination smoothness
+                1.0 * recon_loss +
+              #  0.1 * freq_loss +
+                0.4 * color_loss +  # 0.2 → 0.4 (2배)
+                0.05 * smooth_loss
         )
-
         # print("Total Loss: {} | Recon Loss {} | Freq Loss {} | Color Loss {} | Smooth Loss {}".format(total_loss, recon_loss, freq_loss, color_loss, smooth_loss))
 
+        # return total_loss
 
-        return total_loss
+        # 개선
+        loss_dict = {
+            'total': total_loss.item(),
+            'recon': recon_loss.item(),
+            'freq': freq_loss.item(),
+            'color': color_loss.item(),
+            'smooth': smooth_loss.item(),
+        }
+        return total_loss, loss_dict
 
 # ============= Model Size Checker =============
 def get_model_size(model):

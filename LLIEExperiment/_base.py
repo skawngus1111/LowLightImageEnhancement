@@ -2,6 +2,8 @@ from contextlib import nullcontext
 
 import torch
 
+import numpy as np
+
 from dataset import dataloader_generator
 from utils.get_functions import get_device
 from utils.scheduler import GradualWarmupScheduler, CosineAnnealingRestartCyclicLR
@@ -14,21 +16,21 @@ class BaseExperiment(object):
         self.args = args
         self.args.device = get_device()
         self.scaler = torch.cuda.amp.GradScaler()
-        self.final_epoch = 200
+        self.final_epoch = 100
         self.lr = 1e-3
 
         self.train_loader, self.test_loader = dataloader_generator(args)
 
         self.model = low_light_image_enhancement_model(self.args)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
-        scheduler_step = CosineAnnealingRestartCyclicLR(optimizer=self.optimizer, periods=[(self.final_epoch // 4) - 3, (self.final_epoch * 3) // 4], restart_weights=[1, 1], eta_mins=[0.0002, 0.0000001])
-        self.scheduler = GradualWarmupScheduler(self.optimizer, multiplier=1, total_epoch=3, after_scheduler=scheduler_step)
-        # self.scheduler = self.args.adjust_learning_rate(
-        #     self.optimizer,
-        #     self.final_epoch,
-        #     len(self.train_loader),
-        #     self.lr
-        # )
+        # scheduler_step = CosineAnnealingRestartCyclicLR(optimizer=self.optimizer, periods=[(self.final_epoch // 4) - 3, (self.final_epoch * 3) // 4], restart_weights=[1, 1], eta_mins=[0.0002, 0.0000001])
+        # self.scheduler = GradualWarmupScheduler(self.optimizer, multiplier=1, total_epoch=3, after_scheduler=scheduler_step)
+        self.scheduler = adjust_learning_rate(
+            self.optimizer,
+            self.final_epoch,
+            len(self.train_loader),
+            self.lr
+        )
 
     def forward(self, data_batch):
         data_batch = self.cpu_to_gpu(data_batch)
@@ -45,6 +47,8 @@ class BaseExperiment(object):
         else:
             loss.backward()
             self.optimizer.step()
+
+        self.scheduler.step()
 
     def cpu_to_gpu(self, data):
         dev = self.args.device if isinstance(self.args.device, torch.device) else torch.device(str(self.args.device))

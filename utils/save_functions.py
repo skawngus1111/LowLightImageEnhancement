@@ -9,7 +9,7 @@ from utils.get_functions import get_save_path
 
 def save_model(args, model):
     save_model_path, _ = get_save_path(args)
-    save_model_path = os.path.join(save_model_path, 'model_weights', 'model_weight.pth')
+    save_model_path = os.path.join(save_model_path, 'model_weights', 'model_weight_epoch{}.pth'.format(args.current_epoch))
     torch.save(model.state_dict(), save_model_path)
 
 # def save_predictions(args, predictions, idx):
