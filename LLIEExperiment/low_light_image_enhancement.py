@@ -25,17 +25,17 @@ class LowLightImageEnhancement(BaseExperiment):
 
     def fit(self):
         if self.args.train:
+            # self.model.load_state_dict(torch.load('Epoch99.pth'))
             self.loss_list = []
             print("################ Train ################")
             for epoch in range(1, self.final_epoch + 1):
                 self.psnr_list, self.ssim_list, self.lpips_list, self.c_loss_list = [], [], [], []
                 self.args.current_epoch = epoch
                 self.train_epoch(epoch)
-                # self.scheduler.step()
-                # self.val_epoch(epoch)
+                self.scheduler.step()
                 if epoch % 10 == 0:
                     # save_model(self.args, self.model)
-                    self.inference_no_groundtruth()
+                    self.val_epoch(epoch)
 
         save_model(self.args, self.model)
         print("################ Inference ##############")
@@ -83,87 +83,31 @@ class LowLightImageEnhancement(BaseExperiment):
     def train_epoch(self, epoch):
         self.model.train()
 
-        # 🔥 각 loss 구성 요소 추적용 딕셔너리 추가
-        epoch_losses = {
-            'total': [],
-            'recon': [],
-            'freq': [],
-            'color': [],
-            'smooth': []
-        }
-
         for data_batch in tqdm(self.train_loader):
-            LQ_original_image, HQ_original_image = data_batch['LQ_image'], data_batch['HQ_image']
-
-            for rate in self.size_rates:
-                LQ_image, HQ_image = data_batch['LQ_image'], data_batch['HQ_image']
-
-                # ---- rescale ----
-                trainsize = int(round(256 * rate / 32) * 32)
-
-                if rate != 1:
-                    LQ_image = F.upsample(LQ_image, size=(trainsize, trainsize), mode='bilinear', align_corners=True)
-                    HQ_image = F.upsample(HQ_image, size=(trainsize, trainsize), mode='bilinear', align_corners=True)
-                    data_batch['LQ_image'] = LQ_image
-                    data_batch['HQ_image'] = HQ_image
-                else:
-                    data_batch['LQ_image'] = LQ_original_image
-                    data_batch['HQ_image'] = HQ_original_image
-
                 output_batch = self.forward(data_batch)
                 self.backward(output_batch['loss'])
-
-                if rate == 1:
-                    # 🔥 Loss 구성 요소 저장
-                    loss_dict = output_batch['loss_dict']
-                    for key in epoch_losses.keys():
-                        if key in loss_dict:
-                            epoch_losses[key].append(loss_dict[key])
-
-                    # 기존 코드 (변경 없음)
-                    self.loss_list.append(output_batch['loss'].item())
-                    self.c_loss_list.append(output_batch['loss'].item())
-
-                    for prediction_, HQ_image_ in zip(output_batch['prediction'], data_batch['HQ_image']):
-                        psnr, ssim = compute_measure(prediction_, HQ_image_)
-                        self.psnr_list.append(psnr)
-                        self.ssim_list.append(ssim)
-
-        # 🔥 평균 계산
-        c_loss = np.average(self.c_loss_list)
-        c_psnr = np.average(self.psnr_list)
-        c_ssim = np.average(self.ssim_list)
-        avg_losses = {key: np.average(values) for key, values in epoch_losses.items()}
-
-        # 🔥 상세 출력
-        print("\n" + "=" * 70)
-        print(f"EPOCH {epoch}")
-        print("=" * 70)
-        print(f"Total Loss:  {c_loss:.4f}")
-        print(f"  ├─ Recon:  {avg_losses['recon']:.4f}")
-        print(f"  ├─ Freq:   {avg_losses['freq']:.4f}")
-        print(f"  ├─ Color:  {avg_losses['color']:.4f}")
-        print(f"  └─ Smooth: {avg_losses['smooth']:.4f}")
-        print("-" * 70)
-        print(f"PSNR: {c_psnr:.2f} dB | SSIM: {c_ssim:.4f}")
-        print("=" * 70 + "\n")
+                self.loss_list.append(output_batch['loss'].item())
+                self.c_loss_list.append(output_batch['loss'].item())
 
     def val_epoch(self, epoch):
         self.model.eval()
-
         psnr_list, ssim_list, lpips = [], [], 0
         ctx = torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
         with ctx():
-            for counter, data_batch in enumerate(tqdm(self.test_loader)):
+            for counter, data_batch in enumerate(tqdm(self.valid_loader)):
                 output_batch = self.forward(data_batch)
                 # import matplotlib.pyplot as plt
-                # fig, ax = plt.subplots(1, 2)
-                # ax[0].imshow(np.transpose(output_batch['prediction'].squeeze().cpu().detach().numpy(), (1, 2, 0)))
-                # ax[1].imshow(np.transpose(data_batch['HQ_image'].squeeze().cpu().detach().numpy(), (1, 2, 0)))
+                # fig, ax = plt.subplots(1, 3)
+                # ax[0].imshow(np.transpose(data_batch['LQ_image'].squeeze().cpu().detach().numpy(), (1, 2, 0)))
+                # ax[1].imshow(np.transpose(output_batch['prediction'].squeeze().cpu().detach().numpy(), (1, 2, 0)))
+                # ax[2].imshow(np.transpose(data_batch['HQ_image'].squeeze().cpu().detach().numpy(), (1, 2, 0)))
                 # plt.show()
                 psnr, ssim = compute_measure(output_batch['prediction'], data_batch['HQ_image'])
                 psnr_list.append(psnr)
                 ssim_list.append(ssim)
+
+                if counter >= 40:
+                    save_predictions(self.args, output_batch['prediction'], counter, validation=True, psnr=psnr, ssim=ssim)
 
         c_psnr = np.average(psnr_list)
         c_ssim = np.average(ssim_list)

@@ -224,7 +224,8 @@ class NTIRE2026_EfficientLLIETrainDataset(Dataset):
     def __init__(self,
                  data_dir,
                  img_size=256,
-                 use_augmentation=True,
+                 validation=False,
+                 use_augmentation=False,
                  gamma_range=(0.7, 1.3),
                  noise_prob=0.3,
                  noise_level=(0.01, 0.03)):
@@ -234,12 +235,20 @@ class NTIRE2026_EfficientLLIETrainDataset(Dataset):
         self.dataset_dir = os.path.join(data_dir, 'train')
         self.img_size = img_size
         self.use_augmentation = use_augmentation
+        self.validation_index = 300
 
         low_quality_folder = os.path.join(self.dataset_dir, 'low-20260203T115952Z-3-001', 'low')
         high_quality_folder = os.path.join(self.dataset_dir, 'normal-20260203T115952Z-3-001', 'normal')
 
         self.low_quality_folder_list = natsorted(glob(os.path.join(low_quality_folder, '*.jpg')))
         self.high_quality_folder_list = natsorted(glob(os.path.join(high_quality_folder, '*.jpg')))
+
+        if validation:
+            self.low_quality_folder_list = self.low_quality_folder_list[self.validation_index:]
+            self.high_quality_folder_list = self.high_quality_folder_list[self.validation_index:]
+        else:
+            self.low_quality_folder_list = self.low_quality_folder_list[:self.validation_index]
+            self.high_quality_folder_list = self.high_quality_folder_list[:self.validation_index]
 
         assert len(self.low_quality_folder_list) == len(self.high_quality_folder_list), \
             f"Mismatch: {len(self.low_quality_folder_list)} LQ vs {len(self.high_quality_folder_list)} HQ"
@@ -249,7 +258,7 @@ class NTIRE2026_EfficientLLIETrainDataset(Dataset):
             self.augmentation = LowLightAugmentation(
                 img_size=img_size,
                 use_geometric=True,
-                use_photometric=True,
+                use_photometric=False,
                 gamma_range=gamma_range,
                 noise_prob=noise_prob,
                 noise_level=noise_level
@@ -258,6 +267,11 @@ class NTIRE2026_EfficientLLIETrainDataset(Dataset):
             # Augmentation 없이 resize만
             self.to_tensor = transforms.Compose([
                 transforms.Resize((img_size, img_size)),
+                transforms.ToTensor()
+            ])
+
+        if validation:
+            self.to_tensor = transforms.Compose([
                 transforms.ToTensor()
             ])
 

@@ -19,7 +19,7 @@ class BaseExperiment(object):
         self.final_epoch = 100
         self.lr = 1e-3
 
-        self.train_loader, self.test_loader = dataloader_generator(args)
+        self.train_loader, self.valid_loader, self.test_loader = dataloader_generator(args)
 
         self.model = low_light_image_enhancement_model(self.args)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
@@ -48,7 +48,7 @@ class BaseExperiment(object):
             loss.backward()
             self.optimizer.step()
 
-        self.scheduler.step()
+        # self.scheduler.step()
 
     def cpu_to_gpu(self, data):
         dev = self.args.device if isinstance(self.args.device, torch.device) else torch.device(str(self.args.device))
