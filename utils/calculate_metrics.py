@@ -1,6 +1,6 @@
 import os
 
-os.environ['CUDA_VISIBLE_DEVICES'] = "0"
+# os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 import torch
 import glob
 import cv2
@@ -11,14 +11,29 @@ from tqdm import tqdm
 import argparse
 import platform
 
-def compute_measure(prediction, ground_truth):
-    prediction = np.transpose(prediction.squeeze().cpu().detach().clamp(0, 1).numpy(), (1, 2, 0)) * 255.0
-    ground_truth = np.transpose(ground_truth.squeeze().cpu().detach().clamp(0, 1).numpy(), (1, 2, 0)) * 255.0
+def compute_measure(prediction, ground_truth, lpips_fn=None):
+    """
+    prediction, ground_truth: torch tensor [B,C,H,W] in [0,1] (보통)
+    lpips_fn: lpips.LPIPS instance (eval mode), device는 prediction과 동일해야 함
+    """
+    # -------------------------
+    # PSNR/SSIM용 numpy (0~255)
+    # -------------------------
+    pred_np = prediction.detach().clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0
+    gt_np   = ground_truth.detach().clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0
 
-    psnr = calculate_psnr(prediction, ground_truth)
-    ssim = calculate_ssim(prediction, ground_truth)
+    psnr = calculate_psnr(pred_np, gt_np)
+    ssim = calculate_ssim(pred_np, gt_np)
 
-    return psnr, ssim
+    # LPIPS 입력: (B,3,H,W), [-1,1]
+    pred_lp = prediction.detach().clamp(0, 1) * 2 - 1
+    gt_lp   = ground_truth.detach().clamp(0, 1) * 2 - 1
+
+    with torch.no_grad():
+        lp = lpips_fn(pred_lp, gt_lp)   # shape: [B,1,1,1] or [B,1]
+        lp = float(lp.mean().item())
+
+    return psnr, ssim, lp
 
 def ssim(prediction, target):
     C1 = (0.01 * 255) ** 2

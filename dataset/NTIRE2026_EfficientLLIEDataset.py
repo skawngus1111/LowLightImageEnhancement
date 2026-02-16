@@ -117,6 +117,7 @@ class LowLightAugmentation:
                  img_size=256,
                  use_geometric=True,
                  use_photometric=True,
+                 num_patches=8,
                  gamma_range=(0.7, 1.3),
                  noise_prob=0.3,
                  noise_level=(0.01, 0.03),
@@ -125,6 +126,9 @@ class LowLightAugmentation:
         self.img_size = img_size
         self.use_geometric = use_geometric
         self.use_photometric = use_photometric
+        self.num_patches = num_patches
+        self.dark_candidates = 16  # 후보 개수 (8~32 권장)
+        self.dark_min_mean = 0.0  # 예: 0.002로 두면 “완전 검정” 패치만 고르는 걸 완화
 
         # Photometric augmentation parameters
         self.gamma_range = gamma_range
@@ -133,60 +137,239 @@ class LowLightAugmentation:
         self.color_jitter_prob = color_jitter_prob
 
     def __call__(self, lq_img, hq_img):
-        """
-        Args:
-            lq_img: PIL Image (low quality)
-            hq_img: PIL Image (high quality)
-        Returns:
-            lq_tensor, hq_tensor: Augmented tensors
-        """
-        # Convert to tensor first
-        lq = TF.to_tensor(lq_img)
+        lq = TF.to_tensor(lq_img)  # (C,H,W)
         hq = TF.to_tensor(hq_img)
 
-        # ===== 1. Geometric Augmentation (동일하게 적용!) =====
         if self.use_geometric:
-            lq, hq = self._geometric_augmentation(lq, hq)
+            lq, hq = self._geometric_augmentation(lq, hq)  # ✅ 이제 (K,C,S,S) 또는 (C,S,S)
 
-        # ===== 2. Photometric Augmentation (LQ에만 선택적으로) =====
         if self.use_photometric:
-            lq = self._photometric_augmentation(lq)
+            # LQ에만 적용 (K개면 각 패치별로 적용)
+            if lq.dim() == 4:  # (K,C,H,W)
+                lq = torch.stack([self._photometric_augmentation(lq[k]) for k in range(lq.shape[0])], dim=0)
+            else:
+                lq = self._photometric_augmentation(lq)
 
         return lq, hq
+
+    # def _geometric_augmentation(self, lq, hq):
+    #     """
+    #     기존 방식 유지:
+    #     - 둘 다 img_size보다 크면 random crop
+    #     - 아니면 resize(img_size,img_size)
+    #     단, K(num_patches)개를 반환하되:
+    #       - 앞에서 2개: 완전 랜덤
+    #       - 나머지: 어두운 곳 위주(후보 M개 중 가장 어두운 patch 선택)
+    #     """
+    #     S = self.img_size
+    #     K = self.num_patches
+    #     assert K >= 1
+    #
+    #     # === 1) resize 케이스: 기존 로직대로 SxS로 만든 뒤 K개 반복 ===
+    #     if not (lq.shape[1] > S and lq.shape[2] > S):
+    #         lq = TF.resize(lq, (S, S))
+    #         hq = TF.resize(hq, (S, S))
+    #         if K == 1:
+    #             return lq, hq
+    #         return torch.stack([lq] * K, dim=0), torch.stack([hq] * K, dim=0)
+    #
+    #     # === 2) crop 가능한 케이스 ===
+    #     H, W = lq.shape[1], lq.shape[2]
+    #
+    #     # 2 random + 2 dark가 기본. (K가 4가 아니면 가능한 범위에서 자동 조절)
+    #     k_rand = min(2, K)
+    #     k_dark = K - k_rand
+    #
+    #     # dark patch 고를 때 후보 수 (클수록 더 “진짜 어두운” patch를 고름. 8~32 추천)
+    #     M = getattr(self, "dark_candidates", 16)
+    #
+    #     # 너무 완전한 검정(정보없는) patch만 고르는 걸 방지하고 싶으면 아래 임계값 사용
+    #     # (필요 없으면 0.0으로 두면 됨)
+    #     min_mean = getattr(self, "dark_min_mean", 0.0)  # 예: 0.002 정도
+    #
+    #     def luma_mean(patch):
+    #         # patch: (C,S,S), TF.to_tensor 기준 RGB in [0,1]
+    #         r = patch[0:1]
+    #         g = patch[1:2]
+    #         b = patch[2:3]
+    #         y = 0.299 * r + 0.587 * g + 0.114 * b
+    #         return float(y.mean())
+    #
+    #     def random_crop_pair():
+    #         i = random.randint(0, H - S)
+    #         j = random.randint(0, W - S)
+    #         return lq[:, i:i + S, j:j + S], hq[:, i:i + S, j:j + S]
+    #
+    #     def dark_biased_crop_pair():
+    #         # 후보 M개 중 "가장 어두운(luma mean 최소)" patch 선택
+    #         best = None
+    #         best_score = 1e9
+    #
+    #         for _ in range(M):
+    #             i = random.randint(0, H - S)
+    #             j = random.randint(0, W - S)
+    #             lq_p = lq[:, i:i + S, j:j + S]
+    #             score = luma_mean(lq_p)
+    #
+    #             # 너무 완전한 검정만 고르는 걸 피하고 싶으면 min_mean로 컷
+    #             if score < min_mean:
+    #                 continue
+    #
+    #             if score < best_score:
+    #                 best_score = score
+    #                 best = (lq_p, hq[:, i:i + S, j:j + S])
+    #
+    #         # min_mean 때문에 후보가 전부 걸러지는 예외 대비: 그냥 랜덤 하나 반환
+    #         if best is None:
+    #             return random_crop_pair()
+    #         return best
+    #
+    #     # === 3) 패치 생성 ===
+    #     lq_patches, hq_patches = [], []
+    #
+    #     # (a) 2장 랜덤
+    #     for _ in range(k_rand):
+    #         lp, hp = random_crop_pair()
+    #         lq_patches.append(lp)
+    #         hq_patches.append(hp)
+    #
+    #     # (b) 나머지 어두운 곳 위주
+    #     for _ in range(k_dark):
+    #         lp, hp = dark_biased_crop_pair()
+    #         lq_patches.append(lp)
+    #         hq_patches.append(hp)
+    #
+    #     # === 4) 반환 ===
+    #     if K == 1:
+    #         return lq_patches[0], hq_patches[0]
+    #     return torch.stack(lq_patches, dim=0), torch.stack(hq_patches, dim=0)
 
     def _geometric_augmentation(self, lq, hq):
         """
-        기하학적 변환 (LQ, HQ 동일하게!)
+        기존 방식 유지:
+        - 둘 다 img_size보다 크면 random crop
+        - 아니면 resize(img_size,img_size)
+
+        단, K(num_patches)개를 만들 때:
+        1) 후보 패치 M개를 랜덤 crop으로 생성
+        2) 후보의 mean luma 분포를 K개의 구간으로 나눔(quantile 기반 -> bin이 비는 문제 최소화)
+        3) 각 구간에서 1개씩 선택하여 총 K개 구성
         """
-        # Random Crop
-        if lq.shape[1] > self.img_size and lq.shape[2] > self.img_size:
-            i = random.randint(0, lq.shape[1] - self.img_size)
-            j = random.randint(0, lq.shape[2] - self.img_size)
+        S = self.img_size
+        K = self.num_patches
 
-            lq = lq[:, i:i + self.img_size, j:j + self.img_size]
-            hq = hq[:, i:i + self.img_size, j:j + self.img_size]
-        else:
-            # Resize if smaller than target
-            lq = TF.resize(lq, (self.img_size, self.img_size))
-            hq = TF.resize(hq, (self.img_size, self.img_size))
+        # ===== resize 케이스(기존 로직) =====
+        if not (lq.shape[1] > S and lq.shape[2] > S):
+            lq = TF.resize(lq, (S, S))
+            hq = TF.resize(hq, (S, S))
+            if K == 1:
+                return lq, hq
+            return torch.stack([lq] * K, dim=0), torch.stack([hq] * K, dim=0)
 
-        # Random Horizontal Flip
-        if random.random() > 0.5:
-            lq = TF.hflip(lq)
-            hq = TF.hflip(hq)
+        H, W = lq.shape[1], lq.shape[2]
 
-        # Random Vertical Flip
-        if random.random() > 0.5:
-            lq = TF.vflip(lq)
-            hq = TF.vflip(hq)
+        # 후보 개수: K보다 충분히 크게 (너무 작으면 구간 나눠도 의미가 약함)
+        # 보통 8K~16K 추천. K=64면 512~1024 정도.
+        M = getattr(self, "brightness_candidates", max(8 * K, 64))
 
-        # Random Rotation (90도 단위)
-        if random.random() > 0.5:
-            angle = random.choice([90, 180, 270])
-            lq = TF.rotate(lq, angle)
-            hq = TF.rotate(hq, angle)
+        # ---- luma mean ----
+        def luma_mean(patch):
+            # patch: (3,S,S) in [0,1]
+            r = patch[0:1]
+            g = patch[1:2]
+            b = patch[2:3]
+            y = 0.299 * r + 0.587 * g + 0.114 * b
+            return y.mean()
 
-        return lq, hq
+        # ===== 1) 후보 패치 M개 생성 =====
+        cand_i, cand_j = [], []
+        mus = []
+
+        for _ in range(M):
+            i = random.randint(0, H - S)
+            j = random.randint(0, W - S)
+            p = lq[:, i:i + S, j:j + S]
+            cand_i.append(i)
+            cand_j.append(j)
+            mus.append(luma_mean(p))
+
+        mus = torch.stack(mus)  # (M,)
+
+        # ===== 2) 밝기 분포를 K개 구간으로 나누기 (quantile bin) =====
+        # torch.quantile이 없을 수도 있어서 안전하게 처리
+        qs = torch.linspace(0.0, 1.0, steps=K + 1, device=mus.device)
+
+        try:
+            edges = torch.quantile(mus, qs)  # (K+1,)
+        except Exception:
+            # fallback: 정렬 후 index로 근사 quantile
+            sorted_mus, _ = torch.sort(mus)
+            idx = torch.clamp((qs * (M - 1)).round().long(), 0, M - 1)
+            edges = sorted_mus[idx]
+
+        # edges가 모두 같은 경우(후보가 거의 동일한 밝기): 그냥 랜덤 K개
+        if torch.allclose(edges, edges[0]):
+            pick = random.sample(range(M), k=min(K, M))
+            lq_patches = [lq[:, cand_i[t]:cand_i[t] + S, cand_j[t]:cand_j[t] + S] for t in pick]
+            hq_patches = [hq[:, cand_i[t]:cand_i[t] + S, cand_j[t]:cand_j[t] + S] for t in pick]
+            # 부족하면 중복 허용해서 채움
+            while len(lq_patches) < K:
+                t = random.randrange(M)
+                lq_patches.append(lq[:, cand_i[t]:cand_i[t] + S, cand_j[t]:cand_j[t] + S])
+                hq_patches.append(hq[:, cand_i[t]:cand_i[t] + S, cand_j[t]:cand_j[t] + S])
+            if K == 1:
+                return lq_patches[0], hq_patches[0]
+            return torch.stack(lq_patches, 0), torch.stack(hq_patches, 0)
+
+        # bucketize로 각 후보를 0..K-1 bin에 할당
+        # 경계는 edges[1:-1] 사용
+        bins = torch.bucketize(mus, edges[1:-1], right=False)  # (M,), in [0, K-1]
+
+        # ===== 3) 각 bin에서 1개씩 선택 =====
+        selected = []
+        used = torch.zeros((M,), dtype=torch.bool)
+
+        for b in range(K):
+            idxs = torch.nonzero((bins == b) & (~used), as_tuple=True)[0]
+            if idxs.numel() == 0:
+                selected.append(None)
+                continue
+            # bin 내부에서는 랜덤 1개 (네가 말한 "각 구간 별로 선택" 그대로)
+            t = idxs[random.randrange(idxs.numel())].item()
+            selected.append(t)
+            used[t] = True
+
+        # ===== 4) 빈 bin 채우기 (fallback) =====
+        # 빈 bin이 있다면, 아직 안 쓴 후보 중에서 "그 bin의 대표 밝기"에 가장 가까운 걸 넣음
+        # 대표 밝기: (edges[b] + edges[b+1]) / 2
+        remain = torch.nonzero(~used, as_tuple=True)[0]
+
+        for b in range(K):
+            if selected[b] is not None:
+                continue
+            if remain.numel() == 0:
+                # 후보가 다 소진되면 그냥 아무거나 중복 허용
+                selected[b] = random.randrange(M)
+                continue
+            target = 0.5 * (edges[b] + edges[b + 1])
+            # remain 중 target에 가장 가까운 후보 선택
+            diffs = (mus[remain] - target).abs()
+            best_idx = torch.argmin(diffs).item()
+            t = remain[best_idx].item()
+            selected[b] = t
+            used[t] = True
+            remain = torch.nonzero(~used, as_tuple=True)[0]
+
+        # ===== 5) crop해서 반환 =====
+        lq_patches, hq_patches = [], []
+        for t in selected[:K]:
+            i, j = cand_i[t], cand_j[t]
+            lq_patches.append(lq[:, i:i + S, j:j + S])
+            hq_patches.append(hq[:, i:i + S, j:j + S])
+
+        if K == 1:
+            return lq_patches[0], hq_patches[0]
+        return torch.stack(lq_patches, dim=0), torch.stack(hq_patches, dim=0)
 
     def _photometric_augmentation(self, img):
         """
@@ -225,7 +408,7 @@ class NTIRE2026_EfficientLLIETrainDataset(Dataset):
                  data_dir,
                  img_size=256,
                  validation=False,
-                 use_augmentation=False,
+                 use_augmentation=True,
                  gamma_range=(0.7, 1.3),
                  noise_prob=0.3,
                  noise_level=(0.01, 0.03)):
@@ -236,6 +419,7 @@ class NTIRE2026_EfficientLLIETrainDataset(Dataset):
         self.img_size = img_size
         self.use_augmentation = use_augmentation
         self.validation_index = 300
+        self.validation = validation
 
         low_quality_folder = os.path.join(self.dataset_dir, 'low-20260203T115952Z-3-001', 'low')
         high_quality_folder = os.path.join(self.dataset_dir, 'normal-20260203T115952Z-3-001', 'normal')
@@ -254,26 +438,31 @@ class NTIRE2026_EfficientLLIETrainDataset(Dataset):
             f"Mismatch: {len(self.low_quality_folder_list)} LQ vs {len(self.high_quality_folder_list)} HQ"
 
         # Augmentation 초기화
-        if self.use_augmentation:
-            self.augmentation = LowLightAugmentation(
-                img_size=img_size,
-                use_geometric=True,
-                use_photometric=False,
-                gamma_range=gamma_range,
-                noise_prob=noise_prob,
-                noise_level=noise_level
-            )
-        else:
-            # Augmentation 없이 resize만
-            self.to_tensor = transforms.Compose([
-                transforms.Resize((img_size, img_size)),
-                transforms.ToTensor()
-            ])
-
         if validation:
             self.to_tensor = transforms.Compose([
                 transforms.ToTensor()
             ])
+        else:
+            if self.use_augmentation:
+                self.augmentation = LowLightAugmentation(
+                    img_size=img_size,
+                    use_geometric=True,
+                    use_photometric=False,
+                    gamma_range=gamma_range,
+                    noise_prob=noise_prob,
+                    noise_level=noise_level
+                )
+            else:
+                # Augmentation 없이 resize만
+                self.to_tensor = transforms.Compose([
+                    transforms.Resize((img_size, img_size)),
+                    transforms.ToTensor()
+                ])
+
+        # if validation:
+        #     self.to_tensor = transforms.Compose([
+        #         transforms.ToTensor()
+        #     ])
 
     def __len__(self):
         return len(self.low_quality_folder_list)
@@ -286,13 +475,17 @@ class NTIRE2026_EfficientLLIETrainDataset(Dataset):
         high_quality_image = Image.open(high_quality_image_path).convert('RGB')
 
         # Augmentation 적용
-        if self.use_augmentation:
-            low_quality_tensor, high_quality_tensor = self.augmentation(
-                low_quality_image, high_quality_image
-            )
-        else:
+        if self.validation:
             low_quality_tensor = self.to_tensor(low_quality_image)
             high_quality_tensor = self.to_tensor(high_quality_image)
+        else:
+            if self.use_augmentation:
+                low_quality_tensor, high_quality_tensor = self.augmentation(
+                    low_quality_image, high_quality_image
+                )
+            else:
+                low_quality_tensor = self.to_tensor(low_quality_image)
+                high_quality_tensor = self.to_tensor(high_quality_image)
 
         data_batch = {
             "LQ_image": low_quality_tensor,

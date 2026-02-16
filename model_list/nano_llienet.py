@@ -1,8 +1,46 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
+import lpips
+
+def rgb_to_hsv_torch(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    x: (B,3,H,W), assumed in [0,1]
+    returns: (B,3,H,W) with H,S,V in [0,1]
+    Differentiable w.r.t. x (except at some non-smooth points like max/min ties).
+    """
+    r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
+
+    maxc, _ = x.max(dim=1, keepdim=True)  # (B,1,H,W)
+    minc, _ = x.min(dim=1, keepdim=True)
+    v = maxc
+
+    delt = maxc - minc
+    s = delt / (maxc + eps)
+
+    # Hue
+    # Avoid division by zero
+    delt_safe = delt + eps
+
+    # Compute intermediate hues for each channel being max
+    # Standard HSV formula normalized to [0,1)
+    hr = ((g - b) / delt_safe) % 6.0
+    hg = ((b - r) / delt_safe) + 2.0
+    hb = ((r - g) / delt_safe) + 4.0
+
+    is_r = (maxc == r).to(x.dtype)
+    is_g = (maxc == g).to(x.dtype)
+    is_b = (maxc == b).to(x.dtype)
+
+    h = (hr * is_r + hg * is_g + hb * is_b) / 6.0
+    # delt == 0 (gray) -> hue undefined, set to 0
+    h = torch.where(delt < eps, torch.zeros_like(h), h)
+    h = h % 1.0
+
+    return torch.cat([h, s, v], dim=1)
 
 def rgb_to_luma(x):
     return 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
@@ -13,57 +51,6 @@ def GN(ch, max_groups=8, eps=1e-5, affine=True):
     while ch % g != 0:
         g -= 1
     return nn.GroupNorm(num_groups=g, num_channels=ch, eps=eps, affine=affine)
-
-
-# ============================================================
-# Guided Filter (Fast, O(n), edge-preserving de-posterization)
-# ============================================================
-def box_filter(x, r):
-    """Box filter via avg_pool2d. O(n) regardless of radius."""
-    return F.avg_pool2d(x, kernel_size=2 * r + 1, stride=1, padding=r)
-
-
-def guided_filter(x, guide, r=3, eps=0.02):
-    """
-    Fast Guided Filter for de-posterization.
-
-    원리: guide 이미지의 edge 구조를 보존하면서 smoothing.
-    - guide의 edge가 있는 곳 → 거의 안 바꿈 (진짜 edge)
-    - guide의 edge가 없는 곳 → 평균으로 부드럽게 (posterization 제거)
-
-    Parameters:
-        x:     입력 (gamma-corrected, posterized) [B, C, H, W]
-        guide: guide 이미지 (luma) [B, 1, H, W]
-        r:     filter radius (3이면 7×7 window)
-        eps:   regularization (클수록 더 smooth, 0.01~0.05)
-
-    Returns:
-        filtered: de-posterized [B, C, H, W]
-    """
-    C = x.shape[1]
-
-    # Guide statistics (1-channel)
-    mean_I = box_filter(guide, r)
-    mean_II = box_filter(guide * guide, r)
-    var_I = mean_II - mean_I * mean_I  # guide의 local variance
-
-    # Per-channel filtering
-    mean_p = box_filter(x, r)
-    mean_Ip = box_filter(guide.expand_as(x) * x, r)
-    cov_Ip = mean_Ip - mean_I * mean_p  # guide와 input의 covariance
-
-    # Linear coefficients: output = a * guide + b
-    # var_I가 큰 곳(=진짜 edge) → a가 큼 → guide를 따라감 (edge 보존)
-    # var_I가 작은 곳(=posterization) → a≈0, b≈mean → 평균으로 smooth
-    a = cov_Ip / (var_I + eps)
-    b = mean_p - a * mean_I
-
-    # Average coefficients over window for stability
-    mean_a = box_filter(a, r)
-    mean_b = box_filter(b, r)
-
-    return mean_a * guide.expand_as(x) + mean_b
-
 
 # ============= Ghost Module =============
 class GhostModule(nn.Module):
@@ -100,8 +87,7 @@ class SpatialAttention(nn.Module):
     def forward(self, x):
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x_cat = torch.cat([avg_out, max_out], dim=1)
-        attn = self.sigmoid(self.conv(x_cat))
+        attn = self.sigmoid(self.conv(torch.cat([avg_out, max_out], dim=1)))
         return x * attn
 
 
@@ -119,9 +105,7 @@ class ChannelAttention(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        avg_out = self.fc(self.avg_pool(x))
-        max_out = self.fc(self.max_pool(x))
-        attn = self.sigmoid(avg_out + max_out)
+        attn = self.sigmoid(self.fc(self.avg_pool(x)) + self.fc(self.max_pool(x)))
         return x * attn
 
 
@@ -160,43 +144,30 @@ class MultiScaleFusion(nn.Module):
     def forward(self, x_low, x_high):
         if x_low.shape[2:] != x_high.shape[2:]:
             x_low = F.interpolate(x_low, size=x_high.shape[2:], mode='bilinear', align_corners=False)
-        x_cat = torch.cat([x_low, x_high], dim=1)
-        x_cat = self.conv1x1(x_cat)
-        x3 = self.conv3x3(x_cat)
-        x5 = self.conv5x5(x_cat)
-        out = self.fusion(torch.cat([x3, x5], dim=1))
+        x_cat = self.conv1x1(torch.cat([x_low, x_high], dim=1))
+        out = self.fusion(torch.cat([self.conv3x3(x_cat), self.conv5x5(x_cat)], dim=1))
         return self.act(out)
 
 
 # ============= Main Network =============
 class NanoLLE(nn.Module):
     """
-    v4: Multi-Gamma + Guided Filter + Gain-map + Additive Bias
+    NanoLLE (Multi-gamma 제거 버전)
 
     Pipeline:
-      1. Input x → gamma(x, 1/g) for g in [2,3,4,5] → 각각 guided filter
-      2. cat[x, gf(x^1/2), gf(x^1/3), gf(x^1/4), gf(x^1/5)] → 15ch
-      3. Encoder-Decoder → features
-      4. Gain-map (곱셈, 구조 보존) + Bias (덧셈, 어두운 영역) + Residual
+      1. Input x (3ch) → Encoder-Decoder → features
+      2. Gain-map (곱셈, 구조 보존) + Bias (덧셈, 어두운 영역) + Residual
     """
 
-    def __init__(self, base_channels=24, depths=(2, 2, 3), gn_groups=8,
-                 gamma_values=(2.0, 3.0, 4.0, 5.0),
-                 gf_radius=3, gf_eps=0.02):
+    def __init__(self, base_channels=24, depths=(2, 2, 3), gn_groups=8):
         super().__init__()
         C = base_channels
         d0, d1, db = depths
-        self.gamma_values = gamma_values
-        self.gf_radius = gf_radius
-        self.gf_eps = gf_eps
-        n_gamma = len(gamma_values)
+        self.patch_size = 256
 
-        # Multi-gamma input: original(3) + K gamma versions(3*K) = 15ch
-        in_ch = 3 * (1 + n_gamma)
-
-        # Stem: 15ch → C
+        # Stem: 3ch → C (multi-gamma 제거 → 3ch 고정)
         self.stem = nn.Sequential(
-            nn.Conv2d(in_ch, C, 3, padding=1, bias=False),
+            nn.Conv2d(3, C, 3, padding=1, bias=False),
             GN(C, max_groups=gn_groups),
             nn.ReLU(inplace=True),
         )
@@ -215,6 +186,8 @@ class NanoLLE(nn.Module):
         self.fuse1 = MultiScaleFusion(2 * C)
         self.up1_conv = EnhancedGhostBlock(2 * C, C, gn_groups=gn_groups)
         self.fuse0 = MultiScaleFusion(C)
+
+        self.edge_head = nn.Conv2d(C, 1, kernel_size=1)
 
         # ===== Output Heads =====
         # (1) Gain Map: 곱셈 (구조/색 보존)
@@ -250,72 +223,27 @@ class NanoLLE(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def _build_multi_gamma_input(self, x):
-        """
-        Multi-gamma + debanding.
+    def forward(self, data_batch, lpips_fn):
+        x = data_batch["LQ_image"]  # (B,3,H,W)
+        gt = data_batch.get("HQ_image", None)  # (B,3,H,W) or None
 
-        x: [B, 3, H, W] in [0,1]
-        return: [B, 3*(1+len(gamma_values)), H, W]
-        """
-        inputs = [x]
+        # import numpy as np
+        # import matplotlib.pyplot as plt
+        # for batch_idx in range(x.shape[0]):
+        #     for patch_idx in range(x.shape[1]):
+        #         fig, ax = plt.subplots(1, 2)
+        #         ax[0].imshow(np.transpose(x[batch_idx][patch_idx].cpu().detach().numpy(), (1, 2, 0)))
+        #         ax[1].imshow(np.transpose(gt[batch_idx][patch_idx].cpu().detach().numpy(), (1, 2, 0)))
+        #         plt.show()
+        # print(x.shape)
 
-        # (1) pre: de-quantization / dithering (8-bit banding 깨기)
-        # scale은 상황에 따라 1/255 ~ 2/255 정도부터 시작 추천
-        if getattr(self, "dither_strength", 0.0) > 0:
-            x = (x + (torch.rand_like(x) - 0.5) * self.dither_strength).clamp(0.0, 1.0)
-
-        x_safe = x.clamp(min=1e-6)
-
-        # (2) guide는 gamma_img가 아니라 "원본 기반" (밴딩 엣지 보존 방지)
-        # 원본이 너무 어두우면 log-luma가 더 안정적일 때가 많음
-        guide = rgb_to_luma(x_safe)
-        if getattr(self, "use_log_guide", True):
-            guide = torch.log(guide + 1e-6)
-
-        for g in self.gamma_values:
-            gamma_img = torch.exp(torch.log(x_safe) / g)
-
-            # (3) post: guided debanding (p=gamma_img, I=guide)
-            gamma_filtered = guided_filter(
-                gamma_img, guide,
-                r=self.gf_radius, eps=self.gf_eps
-            ).clamp(0.0, 1.0)
-
-            inputs.append(gamma_filtered)
-
-        return torch.cat(inputs, dim=1)
-
-    def _plot_multi_x(self, multi_x, step=0, out_dir="debug_multi_x"):
-        """
-        multi_x: [B, 3*(1+len(gamma_values)), H, W] in [0,1]
-        배치 0번 샘플만, 3채널씩 끊어서 저장.
-        """
-        import matplotlib.pyplot as plt
-        # os.makedirs(out_dir, exist_ok=True)
-
-        mx = multi_x[0].detach().float().cpu().clamp(0, 1)  # [C,H,W]
-        n_views = mx.shape[0] // 3
-
-        for i in range(n_views):
-            img = mx[i * 3:(i + 1) * 3].permute(1, 2, 0).numpy()  # [H,W,3]
-            plt.figure()
-            plt.imshow(img)
-            plt.axis("off")
-            plt.title(f"view {i}")
-            plt.show()
-
-    def forward(self, data_batch):
-        x = data_batch["LQ_image"]
-        gt = data_batch.get("HQ_image", None)
-
-        # ===== Multi-gamma + de-posterization =====
-        multi_x = self._build_multi_gamma_input(x)  # [B, 15, H, W]
-        # print(multi_x.shape)
-        # self._plot_multi_x(multi_x)
-
+        if x.dim() == 5:  # (B,K,C,H,W)
+            B, K, C, H, W = x.shape
+            x = x.view(B * K, C, H, W)
+            gt = gt.view(B * K, C, H, W)
 
         # ===== Encoder =====
-        f = self.stem(multi_x)
+        f = self.stem(x)
         s0 = self.enc0(f)
 
         f = self.down1(s0)
@@ -333,24 +261,19 @@ class NanoLLE(nn.Module):
         f = self.up1_conv(f)
         f = self.fuse0(f, s0)
 
-        # =====================================================
-        # Gain × input + Bias + Residual
-        # =====================================================
-        raw_gain = self.gain_head(f)
-        gain_map = 1.0 + F.softplus(raw_gain)  # >= 1.0
+        edge_pred = torch.sigmoid(self.edge_head(f))  # (B,1,H,W)
 
-        bias = torch.sigmoid(self.bias_head(f)) * 0.5  # [0, 0.5]
+        # ===== Gain × input + Bias + Residual =====
+        gain_map = 1.0 + F.softplus(self.gain_head(f))  # (B,3,H,W), >= 1
+        bias = torch.sigmoid(self.bias_head(f)) * 0.5  # (B,3,H,W), [0,0.5]
 
         enhanced = (x * gain_map + bias).clamp(0.0, 1.0)
-
-        combined = torch.cat([f, enhanced], dim=1)
-        residual = self.refine(combined)
-
+        residual = self.refine(torch.cat([f, enhanced], dim=1))
         pred = (enhanced + residual).clamp(0.0, 1.0)
 
         # ===== Loss =====
         if gt is not None:
-            loss, loss_dict = self._calculate_loss(data_batch, pred, gt, gain_map)
+            loss, loss_dict = self._calculate_loss(pred, gt, gain_map, lpips_fn, edge_pred=edge_pred, inp_img=x)
         else:
             loss, loss_dict = None, {}
 
@@ -358,6 +281,7 @@ class NanoLLE(nn.Module):
             "prediction": pred,
             "loss": loss,
             "loss_dict": loss_dict,
+            "gain_map": gain_map,
             "illum_map": gain_map[:, 0:1],
             "color_correction": gain_map,
         }
@@ -366,10 +290,8 @@ class NanoLLE(nn.Module):
     # SSIM Loss
     # ============================================================
     def _ssim_loss(self, pred, gt):
-        C1 = 0.01 ** 2
-        C2 = 0.03 ** 2
-        win = 11
-        sigma = 1.5
+        C1, C2 = 0.01 ** 2, 0.03 ** 2
+        win, sigma = 11, 1.5
 
         coords = torch.arange(win, dtype=pred.dtype, device=pred.device) - win // 2
         g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
@@ -380,99 +302,197 @@ class NanoLLE(nn.Module):
         window = window.expand(ch, -1, -1, -1).contiguous()
         pad = win // 2
 
-        mu1 = F.conv2d(pred, window, padding=pad, groups=ch)
-        mu2 = F.conv2d(gt, window, padding=pad, groups=ch)
-        mu1_sq = mu1 ** 2
-        mu2_sq = mu2 ** 2
-        mu1_mu2 = mu1 * mu2
+        mu1  = F.conv2d(pred,      window, padding=pad, groups=ch)
+        mu2  = F.conv2d(gt,        window, padding=pad, groups=ch)
+        mu1_sq, mu2_sq, mu1_mu2 = mu1**2, mu2**2, mu1*mu2
 
-        sigma1_sq = F.conv2d(pred ** 2, window, padding=pad, groups=ch) - mu1_sq
-        sigma2_sq = F.conv2d(gt ** 2, window, padding=pad, groups=ch) - mu2_sq
-        sigma12 = F.conv2d(pred * gt, window, padding=pad, groups=ch) - mu1_mu2
+        s1sq = (F.conv2d(pred**2,    window, padding=pad, groups=ch) - mu1_sq).clamp(min=0)
+        s2sq = (F.conv2d(gt**2,      window, padding=pad, groups=ch) - mu2_sq).clamp(min=0)
+        s12  =  F.conv2d(pred * gt,  window, padding=pad, groups=ch) - mu1_mu2
 
-        sigma1_sq = sigma1_sq.clamp(min=0)
-        sigma2_sq = sigma2_sq.clamp(min=0)
-
-        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
-                   ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-
+        ssim_map = ((2*mu1_mu2 + C1)*(2*s12 + C2)) / ((mu1_sq+mu2_sq+C1)*(s1sq+s2sq+C2))
         return 1.0 - ssim_map.mean()
 
     # ============================================================
     # Loss
     # ============================================================
-    def _calculate_loss(self, data_batch, pred, gt, gain_map):
-        L_in = rgb_to_luma(data_batch["LQ_image"]).clamp(0, 1)
-        w = dark_weight(L_in)
+    def _calculate_loss(self, pred, gt, gain_map, lpips_fn, edge_pred=None, inp_img=None):
+        # 1. Reconstruction (L1)
+        recon_l1 = F.l1_loss(pred, gt)
 
-        # (1) Dark-weighted L1
-        recon_l1 = (w * (pred - gt).abs()).mean()
-
-        # (2) Dark-weighted gradient loss
-        Lp = rgb_to_luma(pred)
-        Lg = rgb_to_luma(gt)
-        gx_p, gy_p = grad_xy(Lp)
-        gx_g, gy_g = grad_xy(Lg)
-        w_x = w[:, :, :, 1:]
-        w_y = w[:, :, 1:, :]
-        grad_loss = (w_x * (gx_p - gx_g).abs()).mean() + \
-                    (w_y * (gy_p - gy_g).abs()).mean()
-
-        # (3) Color loss
-        color_loss = F.l1_loss(
-            pred.mean(dim=[2, 3], keepdim=True),
-            gt.mean(dim=[2, 3], keepdim=True)
-        )
-
-        # (4) SSIM loss
+        # 2. SSIM
         ssim_loss = self._ssim_loss(pred, gt)
 
-        # (5) Gain smoothness
-        gx = gain_map[:, :, :, 1:] - gain_map[:, :, :, :-1]
-        gy = gain_map[:, :, 1:, :] - gain_map[:, :, :-1, :]
-        smooth_loss = gx.abs().mean() + gy.abs().mean()
+        # # 3. Color consistency
+        # pred_hsv = rgb_to_hsv_torch(pred)
+        # gt_hsv = rgb_to_hsv_torch(gt)
+        #
+        # color_loss = F.l1_loss(
+        #     pred_hsv.mean(dim=[2, 3], keepdim=True),
+        #     gt_hsv.mean(dim=[2, 3], keepdim=True)
+        # )
+
+        # # 3. Color consistency (HSV, pixel-wise, hue wrap-around L1)
+        # pred_hsv = rgb_to_hsv_torch(pred)
+        # gt_hsv = rgb_to_hsv_torch(gt)
+        #
+        # color_loss = F.l1_loss(pred_hsv, gt_hsv)
+
+        # pred, gt: (B,3,H,W) in [0,1]
+        # pred_hsv = rgb_to_hsv_torch(pred.clamp(0, 1))
+        # gt_hsv = rgb_to_hsv_torch(gt.clamp(0, 1))
+        #
+        # ph, ps, pv = pred_hsv[:, 0:1], pred_hsv[:, 1:2], pred_hsv[:, 2:3]
+        # gh, gs, gv = gt_hsv[:, 0:1], gt_hsv[:, 1:2], gt_hsv[:, 2:3]
+        #
+        # # Hue embedding: theta = 2πH, then (cos, sin)
+        # theta_p = 2.0 * math.pi * ph
+        # theta_g = 2.0 * math.pi * gh
+        #
+        # p_hue_vec = torch.cat([torch.cos(theta_p), torch.sin(theta_p)], dim=1)  # (B,2,H,W)
+        # g_hue_vec = torch.cat([torch.cos(theta_g), torch.sin(theta_g)], dim=1)  # (B,2,H,W)
+        #
+        # # Pixel-wise L1 on hue-vector (circularly consistent)
+        # hue_loss = (p_hue_vec - g_hue_vec).abs().mean()
+        #
+        # # Pixel-wise L1 on S,V
+        # s_loss = (ps - gs).abs().mean()# + (pv - gv).abs().mean()
+        #
+        # # Total
+        # color_loss = hue_loss + s_loss
+
+        color_loss = hsv_cylinder_cosine_pixelwise_loss(pred, gt)
+
+        # LPIPS Loss
+        pred_lp = pred.clamp(0, 1) * 2 - 1
+        gt_lp = gt.clamp(0, 1) * 2 - 1
+
+        lpips_loss = lpips_fn(pred_lp, gt_lp).mean()
+
+        # # 5. Frequency loss
+        # pred_fft = torch.fft.rfft2(pred, norm='ortho')
+        # gt_fft   = torch.fft.rfft2(gt,   norm='ortho')
+        # freq_loss = F.l1_loss(torch.abs(pred_fft), torch.abs(gt_fft))
 
         total_loss = (
-                1.0 * recon_l1 +
-                0.2 * grad_loss +
-                0.2 * color_loss +
-                0.3 * ssim_loss +
-                0.02 * smooth_loss
+            recon_l1   +
+            ssim_loss +
+            lpips_loss +
+            color_loss
+            # 0.05 * freq_loss
         )
 
+        # ===== (Aux) Edge loss =====
+        edge_loss = pred.new_tensor(0.0)
+        if edge_pred is not None:
+            gt_y = self._luma(gt)
+            gt_edge = self._sobel_mag(gt_y)  # (B,1,H,W)
+
+            # 0..1로 정규화 (이미지별 max로 나눔)
+            denom = gt_edge.detach().amax(dim=[2, 3], keepdim=True).clamp_min(1e-6)
+            gt_edge_norm = gt_edge / denom
+
+            edge_loss = F.l1_loss(edge_pred, gt_edge_norm)
+            total_loss = total_loss + edge_loss
+
         loss_dict = {
-            "total": total_loss.item(),
-            "recon": recon_l1.item(),
-            "grad": grad_loss.item(),
-            "color": color_loss.item(),
-            "ssim": ssim_loss.item(),
-            "smooth": smooth_loss.item(),
+            "total":  total_loss.item(),
+            "recon":  recon_l1.item(),
+            "ssim":   ssim_loss.item(),
+            "lpips": lpips_loss.item(),
+            "color":  color_loss.item(),
+            "edge": edge_loss.item(),  # 추가
+            # "freq":   freq_loss.item(),
         }
         return total_loss, loss_dict
 
+    def _luma(self, x):
+        # x: (B,3,H,W) in [0,1]
+        return 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+
+    def _sobel_mag(self, y):
+        # y: (B,1,H,W)
+        kx = y.new_tensor([[-1, 0, 1],
+                           [-2, 0, 2],
+                           [-1, 0, 1]]).view(1, 1, 3, 3)
+        ky = y.new_tensor([[-1, -2, -1],
+                           [0, 0, 0],
+                           [1, 2, 1]]).view(1, 1, 3, 3)
+        gx = F.conv2d(y, kx, padding=1)
+        gy = F.conv2d(y, ky, padding=1)
+        return torch.sqrt(gx * gx + gy * gy + 1e-6)
+
+def hsv_cylinder_cosine_pixelwise_loss(pred_rgb, gt_rgb, eps=1e-6, beta=1.0):
+    """
+    pred_rgb, gt_rgb: (B,3,H,W) in [0,1]
+    returns scalar loss
+    """
+    pred_hsv = rgb_to_hsv_torch(pred_rgb.clamp(0, 1))
+    gt_hsv   = rgb_to_hsv_torch(gt_rgb.clamp(0, 1))
+
+    ph, ps, pv = pred_hsv[:, 0:1], pred_hsv[:, 1:2], pred_hsv[:, 2:3]
+    gh, gs, gv = gt_hsv[:, 0:1], gt_hsv[:, 1:2], gt_hsv[:, 2:3]
+
+    theta_p = 2.0 * math.pi * ph
+    theta_g = 2.0 * math.pi * gh
+
+    vp = torch.cat([ps * torch.cos(theta_p),
+                    ps * torch.sin(theta_p),
+                    beta * pv], dim=1)  # (B,3,H,W)
+
+    vg = torch.cat([gs * torch.cos(theta_g),
+                    gs * torch.sin(theta_g),
+                    beta * gv], dim=1)  # (B,3,H,W)
+
+    # cosine similarity pixel-wise
+    dot = (vp * vg).sum(dim=1, keepdim=True)  # (B,1,H,W)
+    vp_norm = torch.sqrt((vp * vp).sum(dim=1, keepdim=True) + eps)
+    vg_norm = torch.sqrt((vg * vg).sum(dim=1, keepdim=True) + eps)
+
+    cos_sim = dot / (vp_norm * vg_norm + eps)
+    cos_sim = cos_sim.clamp(-1.0, 1.0)
+
+    loss = (1.0 - cos_sim).mean()
+    return loss
+
+def hs_cylinder_cosine_pixelwise_loss(pred_rgb, gt_rgb, eps=1e-6):
+    # pred_rgb, gt_rgb: (B,3,H,W) in [0,1]
+    pred_hsv = rgb_to_hsv_torch(pred_rgb.clamp(0, 1))
+    gt_hsv   = rgb_to_hsv_torch(gt_rgb.clamp(0, 1))
+
+    ph, ps = pred_hsv[:, 0:1], pred_hsv[:, 1:2]   # Hue, Sat
+    gh, gs = gt_hsv[:, 0:1], gt_hsv[:, 1:2]
+
+    theta_p = 2.0 * math.pi * ph
+    theta_g = 2.0 * math.pi * gh
+
+    # HS vector on a cylinder: [S*cos, S*sin, 1]
+    ones_p = torch.ones_like(ps)
+    ones_g = torch.ones_like(gs)
+
+    vp = torch.cat([ps * torch.cos(theta_p), ps * torch.sin(theta_p), ones_p], dim=1)  # (B,3,H,W)
+    vg = torch.cat([gs * torch.cos(theta_g), gs * torch.sin(theta_g), ones_g], dim=1)  # (B,3,H,W)
+
+    # cosine similarity pixel-wise
+    dot = (vp * vg).sum(dim=1, keepdim=True)  # (B,1,H,W)
+    vp_norm = torch.sqrt((vp * vp).sum(dim=1, keepdim=True) + eps)
+    vg_norm = torch.sqrt((vg * vg).sum(dim=1, keepdim=True) + eps)
+
+    cos_sim = dot / (vp_norm * vg_norm + eps)
+    # optional clamp for numerical stability
+    cos_sim = cos_sim.clamp(-1.0, 1.0)
+
+    loss = (1.0 - cos_sim).mean()
+    return loss
+
 
 # ============================================================
-# Utility functions
+# Utility
 # ============================================================
-def dark_weight(L, tau=0.15, s=0.06, lam=2.0, p=2.0, wmin=0.5, wmax=5.0):
-    m = torch.sigmoid((tau - L) / s)
-    w = 1.0 + lam * (m ** p)
-    w = torch.clamp(w, wmin, wmax)
-    w = w / (w.mean(dim=[2, 3], keepdim=True) + 1e-6)
-    return w
-
-
-def grad_xy(x):
-    gx = x[..., :, 1:] - x[..., :, :-1]
-    gy = x[..., 1:, :] - x[..., :-1, :]
-    return gx, gy
-
-
 def get_model_size(model):
-    param_size = sum(p.nelement() * p.element_size() for p in model.parameters())
+    param_size  = sum(p.nelement() * p.element_size() for p in model.parameters())
     buffer_size = sum(b.nelement() * b.element_size() for b in model.buffers())
     return (param_size + buffer_size) / (1024 ** 2)
-
 
 if __name__ == "__main__":
     model = NanoLLE(base_channels=24, depths=(2, 2, 3), gn_groups=8)
@@ -485,6 +505,6 @@ if __name__ == "__main__":
     }
     with torch.no_grad():
         out = model(dummy)
-    print(f"pred: {out['prediction'].shape}")
-    print(f"loss: {out['loss'].item():.4f}")
-    print(f"loss_dict: {out['loss_dict']}")
+    print(f"pred shape : {out['prediction'].shape}")
+    print(f"loss       : {out['loss'].item():.4f}")
+    print(f"loss_dict  : {out['loss_dict']}")

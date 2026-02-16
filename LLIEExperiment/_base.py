@@ -16,26 +16,23 @@ class BaseExperiment(object):
         self.args = args
         self.args.device = get_device()
         self.scaler = torch.cuda.amp.GradScaler()
-        self.final_epoch = 100
-        self.lr = 1e-3
-
         self.train_loader, self.valid_loader, self.test_loader = dataloader_generator(args)
 
         self.model = low_light_image_enhancement_model(self.args)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr)
         # scheduler_step = CosineAnnealingRestartCyclicLR(optimizer=self.optimizer, periods=[(self.final_epoch // 4) - 3, (self.final_epoch * 3) // 4], restart_weights=[1, 1], eta_mins=[0.0002, 0.0000001])
         # self.scheduler = GradualWarmupScheduler(self.optimizer, multiplier=1, total_epoch=3, after_scheduler=scheduler_step)
         self.scheduler = adjust_learning_rate(
             self.optimizer,
-            self.final_epoch,
+            self.args.final_epoch,
             len(self.train_loader),
-            self.lr
+            self.args.lr
         )
 
     def forward(self, data_batch):
         data_batch = self.cpu_to_gpu(data_batch)
         ctx = torch.cuda.amp.autocast() if self.args.amp else nullcontext()
-        with ctx: return self.model(data_batch)
+        with ctx: return self.model(data_batch, self.lpips_fn)
 
     def backward(self, loss):
         self.optimizer.zero_grad()

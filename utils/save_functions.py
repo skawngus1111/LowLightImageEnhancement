@@ -1,4 +1,5 @@
 import os
+import csv
 
 import torch
 
@@ -8,9 +9,12 @@ import matplotlib.pyplot as plt
 from utils.get_functions import get_save_path
 
 def save_model(args, model):
-    save_model_path, _ = get_save_path(args)
-    save_model_path = os.path.join(save_model_path, 'model_weights', 'model_weight_epoch{}.pth'.format(args.current_epoch))
-    torch.save(model.state_dict(), save_model_path)
+    save_model_path = get_save_path(args)
+    save_model_path = os.path.join(save_model_path, 'model_weights')
+    os.makedirs(save_model_path, exist_ok=True)
+    print(save_model_path)
+
+    torch.save(model.state_dict(), os.path.join(save_model_path, 'model_weight_epoch{}.pth'.format(args.current_epoch)))
 
 # def save_predictions(args, predictions, idx):
 #     save_model_path, _ = get_save_path(args)
@@ -62,7 +66,7 @@ def _draw_metrics_on_pil(img_pil, text, margin=10):
 
     # font: try truetype, fallback to default
     try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 50)
+        font = ImageFont.truetype("DejaVuSans.ttf", 20)
     except:
         font = ImageFont.load_default()
 
@@ -94,7 +98,7 @@ def _draw_metrics_on_pil(img_pil, text, margin=10):
     return img_pil
 
 def save_predictions(args, predictions, idx, validation=False, psnr=None, ssim=None):
-    save_model_path, _ = get_save_path(args)
+    save_model_path = get_save_path(args)
 
     if validation:
         prediction_path = os.path.join(save_model_path, f'predictions_valid_epoch{args.current_epoch}')
@@ -143,3 +147,69 @@ def save_predictions(args, predictions, idx, validation=False, psnr=None, ssim=N
         img_pil = img_pil.convert("RGB")
 
     img_pil.save(os.path.join(prediction_path, fname), quality=95)
+
+def save_loss_graph(args, train_loss_dict, val_loss_dict):
+    save_model_path = get_save_path(args)
+    save_path = os.path.join(save_model_path, f'loss_{args.final_epoch}')
+    os.makedirs(save_path, exist_ok=True)
+
+    keys = ['total_loss', 'recon_loss', 'ssim_loss', 'lpips_loss', 'color_loss', 'edge_loss']
+
+    # ---------- basic sanity ----------
+    # epoch 길이는 가장 짧은 쪽에 맞춤(혹시 중간에 누락되면 에러 방지)
+    def _safe_len(d, k):
+        v = d.get(k, [])
+        return 0 if v is None else len(v)
+
+    n_train = min([_safe_len(train_loss_dict, k) for k in keys] + [10**9])
+    n_val   = min([_safe_len(val_loss_dict, k) for k in keys] + [10**9])
+
+    # train/val 둘 다 존재하는 최소 epoch 길이
+    n = min(n_train, n_val)
+    if n == 0:
+        print("[save_loss_graph] No loss history to plot.")
+        return
+
+    epochs = np.arange(1, n + 1)
+
+    # ---------- save CSV ----------
+    csv_path = os.path.join(save_path, "loss_history.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        header = ["epoch"] + [f"train_{k}" for k in keys] + [f"val_{k}" for k in keys]
+        writer.writerow(header)
+        for i in range(n):
+            row = [int(epochs[i])]
+            row += [float(train_loss_dict[k][i]) for k in keys]
+            row += [float(val_loss_dict[k][i]) for k in keys]
+            writer.writerow(row)
+
+    # ---------- one figure with all losses ----------
+    plt.figure(figsize=(12, 7))
+    for k in keys:
+        plt.plot(epochs, train_loss_dict[k][:n], label=f"train_{k}")
+        plt.plot(epochs, val_loss_dict[k][:n], linestyle="--", label=f"val_{k}")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Train/Val Loss Trend")
+    plt.grid(True, alpha=0.3)
+    plt.legend(ncol=2, fontsize=9)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_path, "loss_all.png"), dpi=200)
+    plt.close()
+
+    # ---------- per-loss figures ----------
+    for k in keys:
+        plt.figure(figsize=(10, 5))
+        plt.plot(epochs, train_loss_dict[k][:n], label=f"train_{k}")
+        plt.plot(epochs, val_loss_dict[k][:n], linestyle="--", label=f"val_{k}")
+        plt.xlabel("Epoch")
+        plt.ylabel(k)
+        plt.title(f"{k} Trend")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_path, f"loss_{k}.png"), dpi=200)
+        plt.close()
+
+    print(f"[save_loss_graph] Saved plots + csv to: {save_path}")
